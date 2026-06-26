@@ -1,6 +1,6 @@
 /* ==========================================================
    app.js — Toàn bộ logic của "Hộp Ký Ức"
-   Mọi nội dung thật (nhạc/video/ảnh/caption) nằm ở js/data.js
+   Cấu hình + hàm gọi Supabase nằm ở js/data.js
 ========================================================== */
 
 const SECTIONS = [
@@ -27,6 +27,7 @@ const ICONS = {
   pencil: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
   trash: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"/></svg>',
   logout: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>',
+  refresh: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></svg>',
 };
 
 /* ---------------- helpers ---------------- */
@@ -44,6 +45,9 @@ const ytThumb = (url) => (ytId(url) ? `https://img.youtube.com/vi/${ytId(url)}/h
 function sectionInfo(key) { return SECTIONS.find((s) => s.key === key); }
 
 /* ---------------- persistence (trình duyệt) ---------------- */
+// Tài khoản người xem thường (không phải admin) vẫn lưu trên máy —
+// chỉ admin mới đăng nhập qua Supabase và dữ liệu nội dung mới
+// đồng bộ qua Supabase.
 function loadUsers() {
   try { return JSON.parse(localStorage.getItem("kyuc_users") || "[]"); } catch (e) { return []; }
 }
@@ -57,16 +61,10 @@ function saveSession(s) {
   else localStorage.removeItem("kyuc_session");
 }
 
+// Nội dung mặc định để hiện ngay trong lúc chờ tải từ Supabase.
 function loadContent() {
-  try {
-    const draft = localStorage.getItem("kyuc_draft_content");
-    if (draft) return JSON.parse(draft);
-  } catch (e) {}
   return JSON.parse(JSON.stringify(SITE_DATA));
 }
-function persistDraft(content) { localStorage.setItem("kyuc_draft_content", JSON.stringify(content)); }
-function hasDraft() { return !!localStorage.getItem("kyuc_draft_content"); }
-function clearDraft() { localStorage.removeItem("kyuc_draft_content"); }
 
 /* ---------------- state ---------------- */
 const state = {
@@ -77,7 +75,7 @@ const state = {
   content: loadContent(),
   openItem: null,
   editItem: null,
-  exportOpen: false,
+  syncing: false,
   toastMsg: "",
 };
 
@@ -88,15 +86,34 @@ function showToast(msg) {
   window.__toastTimer = setTimeout(() => { state.toastMsg = ""; render(); }, 2400);
 }
 
+/* ---------------- đồng bộ với Supabase ---------------- */
+// Tải lại nội dung mới nhất từ Supabase và vẽ lại trang.
+async function refreshFromCloud() {
+  const fresh = await loadSiteData();
+  if (fresh) {
+    state.content = fresh;
+    render();
+  }
+}
+
 /* ---------------- auth actions ---------------- */
-function handleLogin(username, password) {
+async function handleLogin(username, password) {
   state.authError = "";
-  if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    state.session = { username: "Admin", isAdmin: true };
-    saveSession(state.session);
+
+  // Nhập dạng email -> coi là cố gắng đăng nhập admin qua Supabase Auth
+  if (username.includes("@")) {
+    const ok = await adminLogin(username, password);
+    if (ok) {
+      state.session = { username: "Admin", isAdmin: true };
+      saveSession(state.session);
+      render();
+      return;
+    }
+    state.authError = "Sai email hoặc mật khẩu quản trị.";
     render();
     return;
   }
+
   const users = loadUsers();
   const found = users.find((u) => u.username === username && u.password === password);
   if (!found) { state.authError = "Sai tên đăng nhập hoặc mật khẩu."; render(); return; }
@@ -109,7 +126,7 @@ function handleRegister(username, password, confirm) {
   state.authError = "";
   if (!username.trim() || !password) { state.authError = "Vui lòng nhập đầy đủ thông tin."; render(); return; }
   if (password !== confirm) { state.authError = "Mật khẩu nhập lại không khớp."; render(); return; }
-  if (username.trim() === ADMIN_USERNAME) { state.authError = "Tên đăng nhập này không hợp lệ."; render(); return; }
+  if (username.trim().includes("@")) { state.authError = "Tên đăng nhập không được chứa @."; render(); return; }
   const users = loadUsers();
   if (users.find((u) => u.username === username.trim())) { state.authError = "Tài khoản đã tồn tại."; render(); return; }
   users.push({ username: username.trim(), password });
@@ -120,6 +137,9 @@ function handleRegister(username, password, confirm) {
 }
 
 function handleLogout() {
+  if (state.session && state.session.isAdmin) {
+    adminLogout(); // đăng xuất khỏi Supabase, không cần đợi xong
+  }
   state.session = null;
   saveSession(null);
   state.authView = "login";
@@ -137,7 +157,7 @@ function openAddEdit(type, index) {
   render();
 }
 
-function saveEditFromForm(form) {
+async function saveEditFromForm(form) {
   const { type, index } = state.editItem;
   let data;
   if (type === "caption") {
@@ -151,16 +171,24 @@ function saveEditFromForm(form) {
     return;
   }
   state.content[type][index] = data;
-  persistDraft(state.content);
   state.editItem = null;
-  showToast("Đã lưu vào bản nháp trên máy bạn. Nhớ Xuất dữ liệu để mọi người cùng thấy!");
+  state.syncing = true;
+  render();
+
+  const ok = await saveSiteData(state.content);
+  state.syncing = false;
+  showToast(ok ? "Đã lưu! Mọi người sẽ thấy ngay." : "Lưu lên hệ thống thất bại, hãy thử lại.");
 }
 
-function deleteItem(type, index) {
+async function deleteItem(type, index) {
   state.content[type][index] = null;
-  persistDraft(state.content);
   state.openItem = null;
-  showToast("Đã xoá (đã lưu vào bản nháp).");
+  state.syncing = true;
+  render();
+
+  const ok = await saveSiteData(state.content);
+  state.syncing = false;
+  showToast(ok ? "Đã xoá! Mọi người sẽ thấy ngay." : "Xoá thất bại, hãy thử lại.");
 }
 
 /* ---------------- share / save ---------------- */
@@ -204,11 +232,6 @@ function copyCaption(text) {
     .catch(() => showToast("Không copy được."));
 }
 
-/* ---------------- export (admin) ---------------- */
-function exportDataText() {
-  return `const SITE_DATA = ${JSON.stringify(state.content, null, 2)};`;
-}
-
 /* ============================================================
    RENDER
 ============================================================ */
@@ -239,7 +262,7 @@ function renderAuthScreen() {
           <button type="submit" class="btn btn-primary" style="margin-top:6px;">${isLogin ? "Vào trang" : "Tạo tài khoản"}</button>
         </form>
       </div>
-      <p class="note-text">Quản trị viên đăng nhập bằng tài khoản quản trị riêng.</p>
+      <p class="note-text">Quản trị viên đăng nhập bằng email + mật khẩu quản trị (tạo trong Supabase Auth).</p>
     </div>
   </div>`;
 }
@@ -253,7 +276,6 @@ function renderAppScreen() {
     <main class="main-area">${tabContent}</main>
     ${state.openItem && state.content[state.openItem.type][state.openItem.index] ? renderDetailModal() : ""}
     ${state.editItem ? renderEditModal() : ""}
-    ${state.exportOpen ? renderExportModal() : ""}
     ${state.toastMsg ? `<div class="toast">${escapeHtml(state.toastMsg)}</div>` : ""}
   </div>`;
 }
@@ -264,7 +286,7 @@ function renderHeader() {
   <header class="app-header">
     <p class="ff-display">Hộp Ký Ức</p>
     <div class="header-right">
-      ${s.isAdmin ? `<button class="badge admin" data-action="open-export" style="cursor:pointer;">Xuất dữ liệu</button>` : ""}
+      ${s.isAdmin ? `<button class="badge admin" data-action="refresh-cloud" style="cursor:pointer;" ${state.syncing ? "disabled" : ""}>${state.syncing ? "Đang lưu..." : "Tải lại dữ liệu"}</button>` : ""}
       <span class="badge ${s.isAdmin ? "admin" : ""}">${s.isAdmin ? "Quản trị" : escapeHtml(s.username)}</span>
       <button class="icon-btn" data-action="logout" aria-label="Đăng xuất">${ICONS.logout}</button>
     </div>
@@ -348,7 +370,7 @@ function renderDetailModal() {
   } else if (type === "photo") {
     media = `<div class="media-photo"><img src="${escapeHtml(data.url)}" alt="${escapeHtml(data.title || "ảnh")}" /></div>`;
   } else if (type === "caption") {
-    media = `<p class="caption-quote">“${escapeHtml(data.text)}”</p>`;
+    media = `<p class="caption-quote">"${escapeHtml(data.text)}"</p>`;
   }
 
   const titleLine = (type !== "caption" && type !== "music" && data.title) ? `<p class="item-title" style="font-size:15px;margin-top:10px;">${escapeHtml(data.title)}</p>` : "";
@@ -431,30 +453,6 @@ function renderEditModal() {
   </div>`;
 }
 
-function renderExportModal() {
-  return `
-  <div class="modal-overlay" data-action="close-export">
-    <div class="modal" style="max-width:560px;" onclick="event.stopPropagation()">
-      <div class="modal-head">
-        <span class="tag">Xuất dữ liệu</span>
-        <button class="icon-btn" data-action="close-export" aria-label="Đóng">${ICONS.x}</button>
-      </div>
-      <div class="modal-body">
-        <p class="hint-text" style="margin-top:0;">
-          Copy toàn bộ đoạn dưới đây, dán đè vào biến <b>SITE_DATA</b> trong file
-          <b>js/data.js</b> trên GitHub, rồi Commit. Sau khi GitHub Pages build lại,
-          mọi người sẽ thấy đúng nội dung này.
-        </p>
-        <textarea class="export-textarea" id="export-textarea" readonly>${escapeHtml(exportDataText())}</textarea>
-      </div>
-      <div class="modal-foot">
-        <button class="btn btn-primary" data-action="copy-export">${ICONS.copy} Copy toàn bộ</button>
-        <button class="btn btn-ghost" data-action="reset-draft">Bỏ bản nháp, lấy lại dữ liệu gốc từ data.js</button>
-      </div>
-    </div>
-  </div>`;
-}
-
 /* ============================================================
    EVENTS (event delegation)
 ============================================================ */
@@ -503,23 +501,8 @@ document.addEventListener("click", (e) => {
     }
     case "copy-caption":
       copyCaption(state.content.caption[state.openItem.index].text); break;
-    case "open-export":
-      state.exportOpen = true; render(); break;
-    case "close-export":
-      state.exportOpen = false; render(); break;
-    case "copy-export": {
-      const ta = document.getElementById("export-textarea");
-      navigator.clipboard.writeText(ta.value)
-        .then(() => showToast("Đã copy! Dán vào js/data.js trên GitHub."))
-        .catch(() => showToast("Không copy được, hãy bôi đen và copy thủ công."));
-      break;
-    }
-    case "reset-draft":
-      clearDraft();
-      state.content = loadContent();
-      state.exportOpen = false;
-      showToast("Đã lấy lại dữ liệu gốc từ data.js.");
-      break;
+    case "refresh-cloud":
+      refreshFromCloud(); break;
   }
 });
 
@@ -531,7 +514,6 @@ document.addEventListener("submit", (e) => {
     handleRegister(e.target.username.value, e.target.password.value, e.target.confirm.value);
   } else if (e.target.id === "edit-form") {
     saveEditFromForm(e.target);
-    render();
   }
 });
 
@@ -542,4 +524,7 @@ document.addEventListener("submit", (e) => {
   const m = window.location.hash.replace("#", "").match(/^(music|video|photo|caption)-(\d+)$/);
   if (m) { state.tab = m[1]; state.openItem = { type: m[1], index: parseInt(m[2], 10) }; }
   render();
+  // Vẽ tạm bằng dữ liệu mặc định trước, rồi tải bản mới nhất từ
+  // Supabase để mọi người luôn thấy đúng nội dung hiện tại.
+  refreshFromCloud();
 })();
