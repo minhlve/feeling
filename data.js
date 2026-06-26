@@ -1,8 +1,8 @@
-const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+
 const supabaseUrl = 'https://vmfofrwqnzgrtfcrkgev.supabase.co';
 const supabaseKey = 'sb_publishable_BwCEBS9lJPizFAeYc4PZRg_UXgWVuTa';
 
-
+const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
 
 // Dữ liệu mặc định khi chưa tải được từ Supabase
 let SITE_DATA = {
